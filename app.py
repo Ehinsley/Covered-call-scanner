@@ -1,312 +1,303 @@
-"""Phone-first, read-only covered-call and cash-secured-put scanner.
-Deploy app.py, market_data.py, trade_math.py and requirements.txt to Streamlit Cloud.
+"""Phone-friendly options scanner. Single-file application: no custom Python modules required.
+
+Quotes: unofficial Yahoo Finance/yfinance source; may be delayed, stale, rate-limited, or absent.
+The manual Webull quote calculator remains available even if Yahoo fails.
 """
 from __future__ import annotations
-from datetime import datetime, date
-import hmac
-import os
-import re
-import pandas as pd
-import streamlit as st
-from market_data import ET, MarketDataError, tradier_snapshot, yahoo_snapshot
-from trade_math import assess, assess_put, tail_above
 
-st.set_page_config(page_title="Options Income Scanner", page_icon="📱", layout="centered", initial_sidebar_state="collapsed")
+from datetime import date, datetime, timedelta
+import math
+import re
+from statistics import NormalDist, stdev
+from zoneinfo import ZoneInfo
+
+import streamlit as st
+
+ET = ZoneInfo("America/New_York")
+N = NormalDist()
+LEVERAGED = {"HIMZ", "MSTX", "MSTU", "MSTZ", "AMDL", "NVDL", "TSLL", "CONL", "TQQQ", "SOXL", "UPRO", "SPXL", "BITX", "ETHU"}
+
+st.set_page_config(page_title="Options Income Scanner", page_icon="📈", layout="centered")
 st.markdown("""<style>
-.block-container { max-width:810px; padding: .8rem .95rem 4rem; }
-h1 { font-size:1.8rem!important; letter-spacing:-.025em; }
-.stButton button, .stFormSubmitButton button, .stDownloadButton button {min-height:54px; border-radius:12px; font-weight:650;}
-div[data-testid="stMetric"] {padding:12px; border:1px solid rgba(128,140,150,.25); border-radius:13px;}
-@media(max-width:600px){div[data-testid="stMetricValue"]{font-size:1.36rem!important}.block-container{padding:.55rem .75rem 3rem}}
+.block-container {max-width: 790px; padding: .8rem .9rem 4rem;}
+h1 {font-size: 1.8rem !important;}
+.stButton button,.stFormSubmitButton button {min-height: 52px; border-radius: 12px; font-weight:650;}
+div[data-testid="stMetric"] {padding: 12px; border: 1px solid #57616b40; border-radius: 12px;}
+@media(max-width:650px){.block-container{padding:.5rem .65rem 3rem} div[data-testid="stMetricValue"]{font-size:1.35rem!important;}}
 </style>""", unsafe_allow_html=True)
 
-RISKY = {"HIMZ", "MSTX", "MSTU", "MSTZ", "AMDL", "NVDL", "TSLL", "CONL", "TQQQ", "SOXL", "UPRO", "SPXL", "BITX", "ETHU"}
+
+def dollar(x):
+    return f"${x:,.2f}"
 
 
-def secret(name: str, default: str = "") -> str:
+def pc(x):
+    return f"{x:.1%}" if x is not None and math.isfinite(x) else "Not available"
+
+
+def num(v):
     try:
-        return str(st.secrets.get(name, os.environ.get(name, default)))
-    except Exception:
-        return str(os.environ.get(name, default))
+        x = float(v)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
 
 
-def money(v: float) -> str:
-    return f"${v:,.2f}"
+def tail_above(spot, threshold, sigma, dte):
+    """Illustrative probability under zero-drift lognormal terminal stock-price distribution."""
+    if min(spot, threshold, sigma) <= 0 or dte <= 0:
+        return None
+    t = dte / 365.0
+    z = (math.log(threshold / spot) + 0.5 * sigma * sigma * t) / (sigma * math.sqrt(t))
+    return max(0.0, min(1.0, 1.0 - N.cdf(z)))
 
 
-def percent(v: float | None) -> str:
-    return f"{v:.1%}" if v is not None else "N/A"
+def analyze(kind, spot, strike, bid, ask, dte, iv, oi, budget, fee=0.0):
+    """A single standard 100-share option, sold at its quoted bid."""
+    if any(not math.isfinite(x) for x in (spot, strike, bid, ask, fee)):
+        raise ValueError("Price or fee is missing.")
+    if spot <= 0 or strike <= 0 or bid < 0 or ask < bid or dte <= 0 or fee < 0:
+        raise ValueError("Check stock price, strike, bid, ask, expiration, and fees.")
+    share_cost = spot * 100
+    collateral = strike * 100 if kind == "Cash-secured put" else share_cost
+    premium = bid * 100
+    net_credit = premium - fee
+    if kind == "Cash-secured put":
+        breakeven = strike - bid + fee / 100
+        max_profit = net_credit
+        loss_at_zero = max(0.0, collateral - premium + fee)
+        itm = 1 - tail_above(spot, strike, iv, dte) if iv else None
+    else:
+        breakeven = spot - bid + fee / 100
+        max_profit = (strike - spot + bid) * 100 - fee
+        loss_at_zero = max(0.0, collateral - premium + fee)
+        itm = tail_above(spot, strike, iv, dte) if iv else None
 
-
-def age_text(raw: str | None) -> str:
-    if not raw:
-        return "Timestamp unavailable"
-    try:
-        dt = datetime.fromisoformat(str(raw))
-        if dt.tzinfo is None:
-            return str(raw)
-        mins = max(0., (datetime.now(ET)-dt).total_seconds()/60)
-        return f"{dt.strftime('%b %d, %I:%M %p ET')} · {mins:.0f} min old" if mins < 1440 else f"{dt.strftime('%b %d, %Y %I:%M %p ET')} · {mins/1440:.1f} days old"
-    except (ValueError, TypeError):
-        return str(raw)
-
-
-@st.cache_data(ttl=45, show_spinner=False)
-def fetch(symbol: str, low: int, high: int, kind: str, provider: str, token: str):
-    if provider == "Tradier live":
-        return tradier_snapshot(symbol, low, high, token, sandbox=False, kind=kind)
-    if provider == "Tradier sandbox":
-        return tradier_snapshot(symbol, low, high, token, sandbox=True, kind=kind)
-    return yahoo_snapshot(symbol, low, high, kind=kind)
-
-
-password = secret("APP_PASSWORD")
-if password and not st.session_state.get("logged_in", False):
-    st.title("🔐 Options Income Scanner")
-    with st.form("login"):
-        supplied = st.text_input("Private app passcode", type="password")
-        submit = st.form_submit_button("Unlock", use_container_width=True)
-    if submit:
-        if hmac.compare_digest(supplied, password):
-            st.session_state.logged_in = True
-            st.rerun()
+    pprofit = None
+    pdrop = None
+    if iv is not None and 0.03 <= iv <= 8.0:
+        if max_profit <= 0:
+            pprofit = 0.0
+        elif breakeven <= 0:
+            pprofit = 1.0
         else:
-            st.error("Incorrect passcode")
-    st.stop()
+            pprofit = tail_above(spot, breakeven, iv, dte)
+        pdrop = 1 - tail_above(spot, spot * 0.75, iv, dte)
+    denominator = (ask + bid) / 2
+    spread = (ask - bid) / denominator if denominator > 0 else None
+    roi = max_profit / collateral
+    # Screening-quality score: NOT a probability of winning.
+    liq_score = max(0, 1 - (spread or 1) / .40) * min(1, (oi or 0) / 100)
+    yield_score = min(1, max(0, roi) / max(.001, .12 * dte / 365))
+    score = (0.5 * (pprofit if pprofit is not None else 0.3)
+             + 0.2 * yield_score + 0.2 * liq_score
+             + 0.1 * (1 - (pdrop if pdrop is not None else .5)))
+    score = round(100 * score)
+    flags = []
+    if collateral > budget:
+        flags.append("Over your per-trade budget")
+    if max_profit <= 0:
+        flags.append("No positive maximum profit at quoted bid")
+    if bid <= 0:
+        flags.append("No positive bid quote")
+    if spread is None or spread > .35:
+        flags.append("Wide or missing bid/ask spread")
+    if (oi or 0) < 25:
+        flags.append("Low/missing open interest")
+    if iv is None:
+        flags.append("Volatility unavailable: probabilities not estimated")
+    return dict(collateral=collateral, premium=premium, max_profit=max_profit,
+                roi=roi, breakeven=breakeven, loss_at_zero=loss_at_zero,
+                itm=itm, pprofit=pprofit, pdrop=pdrop, spread=spread,
+                score=score, flags=flags)
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def yahoo_scan(ticker, minimum, maximum, side):
+    """All imports/data errors handled by caller; no external app modules needed."""
+    import yfinance as yf
+
+    tk = yf.Ticker(ticker)
+    today = datetime.now(ET).date()
+    hist = tk.history(period="3mo", auto_adjust=False)
+    closes = []
+    if hist is not None and not hist.empty and "Close" in hist:
+        closes = [float(x) for x in hist["Close"].dropna().tolist() if float(x) > 0]
+    if not closes:
+        raise RuntimeError("Yahoo did not return a usable stock price.")
+    spot = closes[-1]
+    rv = None
+    if len(closes) >= 22:
+        changes = [math.log(b / a) for a, b in zip(closes, closes[1:]) if a > 0 and b > 0]
+        if len(changes) >= 20:
+            rv = stdev(changes[-60:]) * math.sqrt(252)
+    expirations = []
+    for item in tk.options:
+        try:
+            d = date.fromisoformat(str(item))
+        except ValueError:
+            continue
+        if minimum <= (d - today).days <= maximum:
+            expirations.append(str(item))
+    rows = []
+    failures = []
+    for expiration in expirations[:10]:
+        try:
+            chain = tk.option_chain(expiration)
+            frame = chain.puts if side == "Cash-secured put" else chain.calls
+            dte = (date.fromisoformat(expiration) - today).days
+            for _, row in frame.iterrows():
+                strike = num(row.get("strike"))
+                bid = num(row.get("bid"))
+                ask = num(row.get("ask"))
+                if strike is None or strike <= 0 or bid is None or bid <= 0 or ask is None or ask < bid:
+                    continue
+                contract = str(row.get("contractSymbol", ""))
+                # Adjusted roots often indicate nonstandard deliverables. Exclude these.
+                clean = ticker.replace(".", "").replace("-", "").upper()
+                m = re.match(r"^([A-Z]+\d?)(\d{6})([CP])(\d{8})$", contract)
+                if m and m.group(1) != clean:
+                    continue
+                iv = num(row.get("impliedVolatility"))
+                if iv is not None and not (.03 <= iv <= 8):
+                    iv = None
+                rows.append(dict(expiration=expiration, dte=dte, strike=strike,
+                                 bid=bid, ask=ask, iv=iv,
+                                 volatility_source="Option implied volatility" if iv else "Historical fallback",
+                                 oi=int(num(row.get("openInterest")) or 0),
+                                 volume=int(num(row.get("volume")) or 0),
+                                 contract=contract))
+        except Exception as exc:
+            failures.append(f"{expiration}: {type(exc).__name__}")
+    return dict(spot=spot, volatility=rv, rows=rows, expirations=expirations,
+                failures=failures, fetched=datetime.now(ET).strftime("%Y-%m-%d %I:%M %p ET"))
+
 
 st.title("📱 Options Income Scanner")
-st.caption("Covered calls + cash-secured puts · Mobile-friendly · Quotes, no trade execution")
+st.caption("Covered calls + cash-secured puts · 100-share contracts · No broker login or trade execution")
+st.info("Automatic prices come from Yahoo Finance, **not Webull**. They can be delayed, stale, or unavailable. Always check the actual bid, ask, and contract deliverable in Webull.")
 
-kind_label = st.radio("Choose a strategy", ["Cash-secured put", "Covered call"], horizontal=True, index=0)
-kind = "put" if kind_label == "Cash-secured put" else "call"
-api_token = secret("TRADIER_TOKEN")
-provider = "Tradier sandbox" if api_token and secret("TRADIER_MODE", "production").lower() == "sandbox" else (
-    "Tradier live" if api_token else "Yahoo delayed")
-if provider == "Tradier live":
-    st.success("**Feed:** Tradier production (live only with proper brokerage market-data entitlement).")
-elif provider == "Tradier sandbox":
-    st.warning("**Feed:** Tradier sandbox (delayed).")
-else:
-    st.warning("**Feed:** Yahoo Finance automatic fallback. Stock/option quotes may be delayed, stale or missing. Live premiums require an eligible Tradier production feed.")
+strategy = st.radio("Strategy", ["Cash-secured put", "Covered call"], horizontal=True)
+mode = st.radio("Market-data mode", ["Automatic Yahoo scan", "Manual Webull quote"], horizontal=True,
+                help="Manual mode works even if the Yahoo feed is blocked or down.")
 
-with st.form("scan"):
-    ticker = st.text_input("Ticker symbol", value="MARA", max_chars=12).strip().upper()
-    a,b = st.columns(2)
-    budget = a.number_input("Max collateral / purchase ($)", min_value=100., value=1000., step=100., format="%.0f")
-    account = b.number_input("Total account ($)", min_value=100., value=4300., step=100., format="%.0f")
-    a,b = st.columns(2)
-    low_dte = a.number_input("Minimum days to expiration", min_value=1, max_value=180, value=21)
-    high_dte = b.number_input("Maximum days to expiration", min_value=1, max_value=365, value=45)
-    with st.expander("Optional strike and probability settings"):
-        low_strike = st.slider("Minimum strike ÷ stock price", .25, 1.5, .65 if kind == "put" else .85, step=.05)
-        high_strike = st.slider("Maximum strike ÷ stock price", .5, 2.0, 1.10 if kind == "put" else 1.20, step=.05)
-        show_over = st.checkbox("Show over-budget trades for research", value=False)
-        drift = st.slider("Assumed annual stock drift (NOT a forecast)", -50, 50, 0, step=5)/100
-        fees = st.number_input("Estimated fees / 1 contract ($)", min_value=0., value=0., step=.50)
-    submitted = st.form_submit_button("🔎 Fetch prices & scan " + ("puts" if kind == "put" else "calls"), type="primary", use_container_width=True)
-
-if submitted:
-    if not re.fullmatch(r"[A-Z][A-Z0-9./-]{0,11}", ticker):
-        st.error("Enter a valid ticker, such as MARA, BB, or HIMZ.")
-    elif low_dte > high_dte or low_strike > high_strike:
-        st.error("Minimum days/strike cannot exceed maximum.")
-    else:
-        with st.spinner("Looking up stock prices, expirations, option bids and asks…"):
-            try:
-                snapshot = fetch(ticker, int(low_dte), int(high_dte), kind, provider, api_token)
-                st.session_state.snapshot = snapshot
-                st.session_state.filter_params = dict(kind=kind, low=int(low_dte), high=int(high_dte),
-                    budget=budget, account=account, low_strike=low_strike, high_strike=high_strike,
-                    show_over=show_over, drift=drift, fees=fees)
-            except MarketDataError as exc:
-                st.session_state.pop("snapshot", None)
-                st.error(str(exc))
-            except ModuleNotFoundError as exc:
-                st.session_state.pop("snapshot", None)
-                st.error(f"Missing Python dependency: {exc.name}. Verify `requirements.txt` is in your GitHub repository root and Streamlit has redeployed.")
-            except Exception as exc:
-                st.session_state.pop("snapshot", None)
-                st.error(f"Market-data service failed ({type(exc).__name__}). Refresh later or verify the data source.")
-
-market = st.session_state.get("snapshot")
-params = st.session_state.get("filter_params")
-if market and params and params["kind"] != kind:
-    st.info("Choose **Fetch prices & scan** to load the selected strategy. The earlier scan is not shown.")
-if market and params and params["kind"] == kind:
-    sym = market["ticker"]
-    spot = market["spot"]
-    st.markdown(f"### {sym} · {'Puts' if kind == 'put' else 'Calls'}")
-    with st.container(border=True):
-        a,b = st.columns(2)
-        a.metric("Reported stock price" if kind == "put" else "Est. share purchase", money(spot))
-        b.metric("Your trade budget", money(params["budget"]))
-        st.caption(f"Provider: {market['provider']} · Stock source: {market['stock_source']}")
-        st.caption("Stock quote: " + age_text(market.get("stock_quote_time")))
-        st.caption("Fetched: " + market["fetched_at"].replace("T", " ") + " ET · Refresh by scanning again (45-sec cache).")
-    if market["delayed"]:
-        st.warning("**Not verified live:** option bid/ask may be stale or missing. Confirm fresh quotes and the actual contract deliverable in Webull before any order.")
-    if sym in RISKY:
-        st.warning("**Leveraged daily-reset ETF:** deep losses and long-run volatility effects aren't reliably captured by the simplified probability model.")
-    if kind == "put":
-        st.info("Cash-secured collateral = **strike × 100** for a standard contract. Selling the put can obligate you to buy 100 shares at that price. Premium received is not guaranteed profit.")
-    else:
-        estimate = spot*100
-        if estimate > params["budget"]:
-            st.warning(f"Buying 100 shares requires around **{money(estimate)}**, above your new-purchase limit. The option credit doesn't eliminate the initial share purchase.")
-
-    eligible = []
-    for option in market["rows"]:
-        dte = (date.fromisoformat(option["expiration"]) - datetime.now(ET).date()).days
-        strike = option["strike"]
-        if not (params["low"] <= dte <= params["high"]):
-            continue
-        if not (params["low_strike"]*spot <= strike <= params["high_strike"]*spot):
-            continue
-        collateral = strike*100 if kind == "put" else spot*100
-        if collateral > params["budget"] and not params["show_over"]:
-            continue
-        bid, ask = option["bid"], option["ask"]
-        credit = bid*100
-        fees = params["fees"]
-        if kind == "put":
-            maxprofit = credit-fees
-            breakeven = strike-bid+fees/100
-            maxloss = max(0, collateral-credit+fees)
+if mode == "Automatic Yahoo scan":
+    with st.form("scan"):
+        ticker = st.text_input("Ticker", value="MARA", max_chars=12).strip().upper()
+        a, b = st.columns(2)
+        budget = a.number_input("Trade limit ($)", value=1000., min_value=100., step=100.)
+        account = b.number_input("Account equity ($)", value=4300., min_value=100., step=100.)
+        a, b = st.columns(2)
+        minimum = a.number_input("Minimum days", min_value=1, max_value=365, value=21)
+        maximum = b.number_input("Maximum days", min_value=1, max_value=365, value=45)
+        over_budget = st.checkbox("Show over-budget trades for comparison", value=False)
+        run = st.form_submit_button("🔎 Fetch prices & scan", type="primary", use_container_width=True)
+    if run:
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,11}", ticker):
+            st.error("Enter a ticker such as MARA or HIMZ.")
+        elif minimum > maximum:
+            st.error("Minimum days must not exceed maximum days.")
         else:
-            maxprofit = (strike-spot+bid)*100-fees
-            breakeven = spot-bid+fees/100
-            maxloss = max(0, collateral-credit+fees)
-        spread = (ask-bid)/((ask+bid)*.5)
-        vol = option["iv"]
-        vol_source = "Provider option IV"
-        if vol is None:
-            vol = market.get("rv")
-            vol_source = "Historical volatility fallback" if vol is not None else "Unavailable"
-        warnings = []
-        model = None
-        if vol is not None and .03 <= vol <= 8.0:
+            with st.spinner("Requesting reported prices and option chains…"):
+                try:
+                    snapshot = yahoo_scan(ticker, int(minimum), int(maximum), strategy)
+                    st.session_state["scanner_data"] = (strategy, ticker, budget, account, over_budget, snapshot)
+                    st.session_state.pop("scanner_error", None)
+                except Exception as exc:
+                    st.session_state.pop("scanner_data", None)
+                    st.session_state["scanner_error"] = (type(exc).__name__, str(exc))
+    if st.session_state.get("scanner_error"):
+        etype, message = st.session_state["scanner_error"]
+        st.error("Yahoo Finance could not supply data right now. Your app is still working; switch to **Manual Webull quote** to calculate a trade.")
+        with st.expander("Error details for troubleshooting"):
+            st.code(f"{etype}: {message[:700]}")
+    data = st.session_state.get("scanner_data")
+    if data and data[0] == strategy:
+        _, sym, budget, account, over_budget, snapshot = data
+        st.subheader(f"{sym} · {strategy}")
+        st.metric("Reported share price (last daily close)", dollar(snapshot["spot"]))
+        st.caption(f"Fetched: {snapshot['fetched']} · Source: Yahoo daily history/option chain · Not a live execution quote")
+        if sym in LEVERAGED:
+            st.warning("This ticker is a daily leveraged ETF. A high option premium does not eliminate substantial loss risk.")
+        if strategy == "Covered call" and snapshot["spot"] * 100 > budget:
+            st.warning(f"Buying 100 shares would cost about {dollar(snapshot['spot'] * 100)}, above your {dollar(budget)} budget.")
+        if not snapshot["expirations"]:
+            st.warning("No expiration dates were returned in the selected 21–45-day window. Try a wider range.")
+        if snapshot["failures"]:
+            st.caption(f"Some expiration chains failed to load ({len(snapshot['failures'])}).")
+        picks = []
+        for option in snapshot["rows"]:
+            iv = option["iv"] if option["iv"] else snapshot["volatility"]
             try:
-                if kind == "put":
-                    model = assess_put(spot, strike, bid, ask, dte, vol, params["budget"], option["oi"],
-                        drift=params["drift"], leveraged=sym in RISKY, fees=fees)
-                else:
-                    model = assess(spot, strike, bid, ask, dte, vol, params["budget"], option["oi"],
-                        drift=params["drift"], leveraged=sym in RISKY)
-                    if fees:
-                        model["p_profit"] = 0.0 if maxprofit <= 0 or breakeven >= strike else (1.0 if breakeven <= 0 else tail_above(spot, breakeven, vol, dte, params["drift"]))
-                warnings.extend(model["warnings"])
+                outcome = analyze(strategy, snapshot["spot"], option["strike"], option["bid"],
+                                  option["ask"], option["dte"], iv, option["oi"], budget)
             except ValueError:
-                pass
-        if not model:
-            warnings.append("No usable volatility; cannot estimate probability")
-        if option["oi"] < 25:
-            warnings.append("Low open interest")
-        if spread > .30:
-            warnings.append("Wide bid/ask spread")
-        if collateral > params["account"]*.30:
-            warnings.append("One position uses over 30% of total account")
-        if kind == "call" and maxprofit <= 0:
-            warnings.append("No maximum profit at call-away price")
-        eligible.append(dict(**option, dte=dte, collateral=collateral, credit=credit,
-            maxprofit=maxprofit, maxloss=maxloss, breakeven=breakeven, spread=spread,
-            vol=vol, vol_source=vol_source, model=model, warnings=list(dict.fromkeys(warnings)),
-            roi=maxprofit/collateral))
-
-    eligible.sort(key=lambda x: (
-        x["model"] is not None and x["model"]["verdict"] not in {"PASS / EXCLUDE"},
-        (x["model"] or {}).get("score", 0), x["oi"], x["roi"]), reverse=True)
-    st.subheader("Matching cash-secured puts" if kind == "put" else "Matching covered calls")
-    if not eligible:
-        st.info("No standard 100-share contracts passed these filters with usable bids/asks. Try another ticker, widen the strike range, or enable research mode. This does not mean no listed options exist.")
-    else:
-        st.caption("Premium calculated using the *bid*. Probability estimates use a one-period lognormal volatility model, **not observed win rates**. Confirm actual execution price and market-data freshness.")
-        for op in eligible[:20]:
-            model = op["model"]
-            with st.container(border=True):
-                st.markdown(f"**{op['expiration']} · ${op['strike']:g} {'PUT' if kind == 'put' else 'CALL'} · {op['dte']} days**")
-                if op["collateral"] > params["budget"]:
-                    st.error("Over your per-trade budget — research only")
-                a,b = st.columns(2)
-                a.metric("Collateral" if kind == "put" else "100-share cost", money(op["collateral"]))
-                b.metric("Premium (bid × 100)", money(op["credit"]))
-                a,b = st.columns(2)
-                a.metric("Break-even / share", money(op["breakeven"]))
-                b.metric("Max profit", money(op["maxprofit"]))
-                a,b = st.columns(2)
-                a.metric("Maximum return / collateral" if kind == "put" else "Max return / share cost", percent(op["roi"]))
-                b.metric("Modeled P(profit)", percent(model["p_profit"]) if model else "N/A")
-                if model:
-                    a,b = st.columns(2)
-                    a.metric("P(finish ITM / possible assignment)" if kind == "put" else "P(finish above strike)",
-                        percent(model["p_itm"] if kind == "put" else model["p_above"]))
-                    b.metric("Trade score (NOT probability)", f"{model['score']}/100")
-                    st.caption("Screening verdict: " + model["verdict"] + " · Simplified assumptions; not a buy signal")
-                with st.expander("Contract, liquidity and downside details"):
-                    st.write(f"**Standard contract:** `{op['contract']}` · Verify 100-share deliverable in Webull")
-                    st.write(f"**Option bid/ask:** {money(op['bid'])} / {money(op['ask'])} · spread {percent(op['spread'])}")
-                    st.write(f"**Bid time:** {age_text(op['bid_time'])} · **Ask time:** {age_text(op['ask_time'])}")
-                    st.write(f"**Open interest:** {op['oi']:,} · **Daily option volume:** {op['volume']:,}")
-                    st.write(f"**Annualized volatility:** {percent(op['vol'])} ({op['vol_source']})")
-                    st.write(f"**Worst-case loss if stock goes to $0:** {money(op['maxloss'])}")
-                    if model:
-                        st.write(f"**P(stock down ≥25% by expiry):** {percent(model['p_drop25'])}")
-                    st.write("Early assignment, earnings, ex-dividend dates, option exercise, tax and slippage events are not automatically checked.")
-                    for warning in op["warnings"]:
-                        st.warning(warning)
-        rows = []
-        for op in eligible:
-            m = op["model"] or {}
-            rows.append(dict(Ticker=sym,Type=kind.upper(),Expiration=op["expiration"],DTE=op["dte"],Strike=op["strike"],
-                Stock_reference=spot,Collateral_or_100_shares=op["collateral"],Option_bid=op["bid"],Option_ask=op["ask"],
-                Premium=op["credit"],Break_even=op["breakeven"],Max_profit=op["maxprofit"],Max_loss=op["maxloss"],
-                Max_return=op["roi"],Modeled_P_profit=m.get("p_profit"),Modeled_P_ITM=m.get("p_itm",m.get("p_above")),
-                Score_NOT_probability=m.get("score"),IV=op["vol"],IV_source=op["vol_source"],
-                Open_interest=op["oi"],Volume=op["volume"],Contract=op["contract"],Bid_timestamp=op["bid_time"],
-                Provider=market["provider"],Warnings="; ".join(op["warnings"])))
-        st.download_button("Download results (CSV)",pd.DataFrame(rows).to_csv(index=False).encode("utf-8"),
-            f"{sym}_{kind}_scan.csv",mime="text/csv",use_container_width=True)
-
-with st.expander("Manual calculator if the quote provider is down", expanded=False):
-    st.caption("Enter your Webull quote. These inputs are NOT fetched live; all example amounts start blank or illustrative.")
-    with st.form("manual_calculator"):
-        m_spot = st.number_input("Current stock price ($)", min_value=.01, value=9.00, step=.25)
-        a,b = st.columns(2)
-        m_strike = a.number_input("Strike ($)", min_value=.01, value=9.0, step=.5)
-        m_bid = b.number_input("Option bid per share ($)", min_value=.01, value=.50, step=.05)
-        a,b = st.columns(2)
-        m_ask = a.number_input("Option ask per share ($)", min_value=.01, value=.60, step=.05)
-        m_dte = b.number_input("Days to expiry", min_value=1, max_value=730, value=30)
-        m_iv = st.number_input("Annual implied volatility (%)", min_value=1., max_value=800., value=60., step=5.)
-        m_fee = st.number_input("Total fee ($)", min_value=0., value=0., step=.50)
-        compute = st.form_submit_button("Calculate from my Webull quote", use_container_width=True)
-    if compute:
+                continue
+            if not over_budget and outcome["collateral"] > budget:
+                continue
+            picks.append((outcome["score"], option, outcome, iv))
+        picks.sort(key=lambda x: x[0], reverse=True)
+        if not picks:
+            st.warning("No usable quoted contracts fit your settings. This may mean the trade exceeds your budget, has no quoted bid, or Yahoo returned incomplete data. Turn on **Show over-budget trades** or use manual mode.")
+        else:
+            st.caption(f"{len(picks)} quoted contracts matched. Ranked by an illustrative trade-quality score, **not** a win probability.")
+            for _, opt, outcome, iv in picks[:15]:
+                label = (f"{opt['expiration']} · ${opt['strike']:g} strike · "
+                         f"${opt['bid']:.2f} bid / ${opt['ask']:.2f} ask")
+                with st.expander(label, expanded=False):
+                    a, b = st.columns(2)
+                    a.metric("Premium at bid", dollar(outcome["premium"]))
+                    b.metric("Cash needed", dollar(outcome["collateral"]))
+                    a, b = st.columns(2)
+                    a.metric("Break-even at expiration", dollar(outcome["breakeven"]))
+                    b.metric("Max profit", dollar(outcome["max_profit"]))
+                    a, b = st.columns(2)
+                    a.metric("Est. profit probability", pc(outcome["pprofit"]))
+                    b.metric("Est. finishes ITM", pc(outcome["itm"]))
+                    st.write(f"Max return on committed capital: **{pc(outcome['roi'])}**  ·  Quality score: **{outcome['score']}/100**")
+                    st.write(f"Volume: {opt['volume']} · Open interest: {opt['oi']} · IV used: {pc(iv)}")
+                    st.caption(f"Expiration: {opt['dte']} days · Max theoretical loss if stock goes to zero: {dollar(outcome['loss_at_zero'])}")
+                    for flag in outcome["flags"]:
+                        st.caption("⚠️ " + flag)
+else:
+    with st.form("manual"):
+        st.caption("Enter the prices you see in Webull. Uses the **bid** as the conservative sell-to-open premium estimate.")
+        a, b = st.columns(2)
+        spot = a.number_input("Stock price ($)", min_value=.01, value=9.00, step=.10, format="%.2f")
+        strike = b.number_input("Option strike ($)", min_value=.01, value=9.00, step=.50, format="%.2f")
+        a, b = st.columns(2)
+        bid = a.number_input("Option bid ($/share)", min_value=0., value=.65, step=.05, format="%.2f")
+        ask = b.number_input("Option ask ($/share)", min_value=0., value=.80, step=.05, format="%.2f")
+        a, b = st.columns(2)
+        expiry = a.date_input("Expiration date", value=datetime.now(ET).date() + timedelta(days=30))
+        iv_pct = b.number_input("Annual volatility (%)", min_value=0., max_value=800., value=80., step=5.)
+        a, b = st.columns(2)
+        budget = a.number_input("Trade limit ($)", min_value=100., value=1000., step=100.)
+        fee = b.number_input("Estimated fees ($)", min_value=0., value=0., step=.5)
+        oi = st.number_input("Open interest (0 if unknown)", min_value=0, value=100)
+        calculate = st.form_submit_button("🧮 Calculate trade", type="primary", use_container_width=True)
+    if calculate:
+        dte = (expiry - datetime.now(ET).date()).days
         try:
-            if kind == "put":
-                x = assess_put(m_spot,m_strike,m_bid,m_ask,m_dte,m_iv/100,budget,100,
-                               drift=drift,fees=m_fee)
-                st.metric("Put cash collateral",money(x["cost"]))
-                st.metric("Max profit",money(x["max_profit"]))
-                st.metric("Break-even / share",money(x["breakeven"]))
-                st.metric("Modeled P(profit)",percent(x["p_profit"]))
-                st.metric("Modeled P(finish ITM)",percent(x["p_itm"]))
-            else:
-                x = assess(m_spot,m_strike,m_bid,m_ask,m_dte,m_iv/100,budget,100,drift=drift)
-                st.metric("100-share cost",money(x["cost"]))
-                st.metric("Max profit before fees",money(x["max_profit"]))
-                st.metric("Break-even before fees",money(x["breakeven"]))
-                st.metric("Modeled P(profit) before fees",percent(x["p_profit"]))
-                if m_fee:
-                    st.caption("Call results above exclude entered fees. Fee-adjusted maximum profit = "+money(x["max_profit"]-m_fee))
-            st.caption("Model estimate only. Use a genuine bid, verify the 100-share deliverable, and remember that early assignment and sharp losses can occur.")
+            result = analyze(strategy, spot, strike, bid, ask, dte, iv_pct / 100 if iv_pct else None, oi, budget, fee)
+            st.subheader("Trade estimate")
+            a, b = st.columns(2)
+            a.metric("Premium received", dollar(result["premium"]))
+            b.metric("Required capital", dollar(result["collateral"]))
+            a, b = st.columns(2)
+            a.metric("Break-even at expiration", dollar(result["breakeven"]))
+            b.metric("Maximum profit", dollar(result["max_profit"]))
+            a, b = st.columns(2)
+            a.metric("Modeled profit probability", pc(result["pprofit"]))
+            b.metric("Modeled finishes ITM", pc(result["itm"]))
+            st.write("Max return on capital:", pc(result["roi"]))
+            st.write("Max theoretical loss (stock goes to zero):", dollar(result["loss_at_zero"]))
+            for item in result["flags"]:
+                st.warning(item)
         except ValueError as exc:
-            st.error(f"Check the entered values: {exc}")
+            st.error(str(exc))
 
 st.divider()
-with st.expander("Trade math and probability limitations"):
-    st.write("**Cash-secured put:** Collateral = 100×strike; premium = 100×put bid; maximum profit = premium − fees; break-even/share = strike − bid + fees/100; maximum possible loss = 100×strike − premium + fees. When assigned, you purchase 100 shares at the strike regardless of a lower market price.")
-    st.write("**Covered call:** Buy 100 shares; write 1 standard call; maximum profit at expiration = 100×(strike − paid share price + bid) − fees. A call does not remove the risk of losses on the stock.")
-    st.write("**Estimated P(profit):** Chance the stock finishes above the net break-even under a single-date lognormal model with 0% annual drift by default and option IV (or historical realized volatility). Simplifying assumptions make these uncalibrated numbers inappropriate for predicting individual outcomes. An estimated 80% is not an 80% historical success rate.")
-    st.write("**P(finish ITM):** For puts, chance the stock finishes below strike. This is not the probability of early assignment. American-style contracts can be exercised early.")
-    st.write("**Trade score:** Heuristic combining modeled probability, maximum return, liquidity and risk. Not a probability, guarantee, or substitute for fundamental analysis. Earnings and pending corporate actions are **not automatically screened**.")
-    st.write("**Quotes:** Tradier production requires eligible brokerage entitlements; sandbox is delayed; Yahoo is delayed/unverified. The app reads prices only; it never places orders. Tokens belong in Streamlit Secrets, never GitHub.")
-st.caption("Research, not personalized trade execution advice · Check real quotes and contract details with your brokerage before entering orders.")
+with st.expander("How the probability estimate works"):
+    st.write("Estimates assume the share price at expiration follows a lognormal distribution with zero expected annual price drift and the entered/implied/historical annual volatility. This is an illustration, not a calibrated forecast or guarantee. A leveraged ETF may diverge greatly from these assumptions. American-style options may be assigned before expiration. The score is a subjective screening heuristic, not a probability.")
+    st.write("One standard contract controls 100 shares. Put collateral = 100 × strike; covered-call purchase = 100 × stock price. Premium is not free profit: the underlying shares can fall sharply.")
