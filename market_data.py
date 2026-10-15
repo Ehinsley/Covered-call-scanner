@@ -53,11 +53,13 @@ def iso_time(raw: Any) -> str | None:
         return None
 
 
-def call_rows(exp: str, options: list[dict], symbol: str) -> list[dict]:
+def option_rows(exp: str, options: list[dict], symbol: str, kind: str="call") -> list[dict]:
     """Strictly exclude nonstandard / adjusted deliverables and unusable option quotes."""
+    if kind not in {"call", "put"}:
+        raise ValueError("Unknown option type")
     res: list[dict] = []
     for op in options:
-        if str(op.get("option_type", "")).lower() != "call":
+        if str(op.get("option_type", "")).lower() != kind:
             continue
         underlying = str(op.get("underlying") or symbol).upper().replace(".", "/")
         root = str(op.get("root_symbol") or symbol).upper().replace(".", "/")
@@ -94,6 +96,15 @@ def call_rows(exp: str, options: list[dict], symbol: str) -> list[dict]:
     return res
 
 
+def call_rows(exp: str, options: list[dict], symbol: str) -> list[dict]:
+    """Backward-compatible standard-call filter."""
+    return option_rows(exp, options, symbol, "call")
+
+
+def put_rows(exp: str, options: list[dict], symbol: str) -> list[dict]:
+    return option_rows(exp, options, symbol, "put")
+
+
 def tradier_get(token: str, endpoint: str, params: dict, *, sandbox: bool = False, session=None) -> dict:
     if not token or not token.strip():
         raise MarketDataError("Tradier API token is missing. Configure server secrets or choose Yahoo fallback.")
@@ -123,7 +134,9 @@ def tradier_get(token: str, endpoint: str, params: dict, *, sandbox: bool = Fals
     return payload
 
 
-def tradier_snapshot(ticker: str, min_dte: int, max_dte: int, token: str, sandbox: bool = False) -> dict:
+def tradier_snapshot(ticker: str, min_dte: int, max_dte: int, token: str, sandbox: bool = False, kind: str = "call") -> dict:
+    if kind not in {"call", "put"}:
+        raise MarketDataError("Unknown option type")
     sym = validated_symbol(ticker)
     q = tradier_get(token, "/markets/quotes", {"symbols": sym}, sandbox=sandbox)
     item = (q.get("quotes") or {}).get("quote") if isinstance(q.get("quotes"), dict) else None
@@ -135,8 +148,14 @@ def tradier_snapshot(ticker: str, min_dte: int, max_dte: int, token: str, sandbo
     last = number(item.get("last"))
     stock_bid = number(item.get("bid"))
     # When there is no valid ask, fall back to last and make it explicit.
-    spot = ask if ask is not None and ask > 0 else last
-    stock_source = "stock ask" if spot == ask and ask and ask > 0 else "stock last (ask unavailable)"
+    # Buy-writes budget shares at the ask; put sellers model the underlying
+    # using the last traded price, not an optimistic mark at the ask.
+    if kind == "call":
+        spot = ask if ask is not None and ask > 0 else last
+        stock_source = "stock ask" if spot == ask and ask and ask > 0 else "stock last (ask unavailable)"
+    else:
+        spot = last if last is not None and last > 0 else (ask if ask is not None and ask > 0 else stock_bid)
+        stock_source = "stock last" if spot == last and last is not None and last > 0 else "stock quote fallback"
     if spot is None or spot <= 0:
         raise MarketDataError("Stock price is missing. No purchase estimate can be produced.")
 
@@ -181,7 +200,7 @@ def tradier_snapshot(ticker: str, min_dte: int, max_dte: int, token: str, sandbo
             if isinstance(options, dict):
                 options = [options]
             if isinstance(options, list):
-                rows.extend(call_rows(ex, options, sym))
+                rows.extend(option_rows(ex, options, sym, kind))
         except MarketDataError:
             failures += 1
     if selected and failures == len(selected[:12]):
@@ -197,10 +216,12 @@ def tradier_snapshot(ticker: str, min_dte: int, max_dte: int, token: str, sandbo
     }
 
 
-def yahoo_snapshot(ticker: str, min_dte: int, max_dte: int) -> dict:
+def yahoo_snapshot(ticker: str, min_dte: int, max_dte: int, kind: str = "call") -> dict:
     """Free fallback. Yahoo option bids/asks can be stale or zero. Never label them live."""
     import yfinance as yf
     import pandas as pd
+    if kind not in {"call", "put"}:
+        raise MarketDataError("Unknown option type")
     sym = validated_symbol(ticker)
     try:
         asset = yf.Ticker(sym)
@@ -230,7 +251,8 @@ def yahoo_snapshot(ticker: str, min_dte: int, max_dte: int) -> dict:
             if not min_dte <= dte <= max_dte:
                 continue
             try:
-                options = asset.option_chain(exp).calls
+                chain = asset.option_chain(exp)
+                options = chain.calls if kind == "call" else chain.puts
             except Exception:
                 continue
             for _, item in options.iterrows():
@@ -247,7 +269,7 @@ def yahoo_snapshot(ticker: str, min_dte: int, max_dte: int) -> dict:
                 if not opt_sym.startswith(sym):
                     continue
                 suffix = opt_sym[len(sym):]
-                if not re.fullmatch(r"\d{6}C\d{8}", suffix):
+                if not re.fullmatch(r"\d{6}" + ("C" if kind == "call" else "P") + r"\d{8}", suffix):
                     continue
                 iv = number(item.get("impliedVolatility"))
                 if iv is None or not 0.03 <= iv <= 8:

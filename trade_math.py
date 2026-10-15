@@ -73,3 +73,65 @@ def assess(spot: float, strike: float, bid: float, ask: float, days: int,
                 p_profit=p_profit, p_above=p_above, p_drop25=p_drop_25,
                 spread_pct=spread_pct, score=score, verdict=verdict,
                 max_loss=max(0, share_cost-credit), warnings=warnings)
+
+
+def assess_put(spot: float, strike: float, bid: float, ask: float, days: int,
+               sigma: float, budget: float, open_interest: int=0,
+               drift: float=0.0, earnings: bool=False, leveraged: bool=False,
+               contract_size: int=100, fees: float=0.0) -> dict:
+    """Sell one cash-secured standard put at bid, hold required strike*100 collateral.
+
+    All percentages are expiration-date estimates, not calibrated forecasts.
+    Assignment can occur before expiration for American-style contracts.
+    """
+    values = (spot, strike, bid, ask, sigma)
+    if any(not math.isfinite(v) for v in values) or min(values) <= 0:
+        raise ValueError("Invalid spot, strike, put bid/ask or volatility")
+    if not math.isfinite(fees) or fees < 0 or days < 1 or ask < bid or contract_size != 100:
+        raise ValueError("Check days, option spread, fees and 100-share deliverable")
+    if not (-1.0 <= drift <= 1.0):
+        raise ValueError("Drift out of supported range")
+    collateral = strike * contract_size
+    credit = bid * contract_size
+    max_profit = credit - fees
+    breakeven = strike - bid + fees/contract_size
+    max_loss = max(0.0, collateral - credit + fees)
+    max_return = max_profit / collateral
+    # expiration payoff = 100 * (premium - max(strike - S_T, 0)) - fees
+    if max_profit <= 0 or breakeven >= strike:
+        p_profit = 0.0
+    elif breakeven <= 0:
+        p_profit = 1.0
+    else:
+        p_profit = tail_above(spot, breakeven, sigma, days, drift)
+    # Probability of finishing in the money, not probability of early assignment.
+    p_itm = 1.0 - tail_above(spot, strike, sigma, days, drift)
+    p_drop25 = 1.0 - tail_above(spot, spot*.75, sigma, days, drift)
+    spread_pct = (ask - bid)/((ask + bid)*.5)
+    # Screening heuristic intentionally distinct from P(profit).
+    time_years = days/365.0
+    yield_quality = clamp(max_return/(0.35*time_years))
+    liquidity_quality = clamp(1.0-spread_pct/.40)*clamp(open_interest/100.0)
+    score = round(100*clamp(.45*p_profit + .20*yield_quality + .20*liquidity_quality + .15*(1-p_drop25))
+                  - (10 if earnings else 0) - (10 if leveraged else 0))
+    score = min(100, max(0, score))
+    warnings = []
+    if collateral > budget: warnings.append("Strike × 100 exceeds cash-secured collateral budget")
+    if max_profit <= 0: warnings.append("The premium does not cover estimated fees")
+    if spread_pct > .35: warnings.append("Wide bid/ask spread")
+    if open_interest < 25: warnings.append("Low open interest")
+    if earnings: warnings.append("Possible earnings during holding period")
+    if leveraged: warnings.append("Daily-reset leveraged ETF: severe/path-dependent downside risk")
+    if days > 90: warnings.append("Long holding period")
+    if collateral > budget or max_profit <= 0 or spread_pct > .35:
+        verdict = "PASS / EXCLUDE"
+    elif score >= 75:
+        verdict = "WATCHLIST / VERIFY"
+    elif score >= 60:
+        verdict = "REVIEW"
+    else:
+        verdict = "LOW PRIORITY"
+    return dict(cost=collateral, credit=credit, breakeven=breakeven, max_profit=max_profit,
+                max_return=max_return, max_loss=max_loss, p_profit=p_profit,
+                p_itm=p_itm, p_no_assignment=1-p_itm, p_drop25=p_drop25,
+                spread_pct=spread_pct, score=score, verdict=verdict, warnings=warnings)
