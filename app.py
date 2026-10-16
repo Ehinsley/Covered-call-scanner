@@ -663,7 +663,7 @@ def selection_from_discovery(web_items, universe_limit, max_stock_price):
 def main():
     st.set_page_config(page_title="Automatic Options Opportunity Report", page_icon="📈", layout="wide")
     st.title("📈 Automatic Options Opportunity Report")
-    st.caption("One tap searches candidate stocks, checks puts and calls, and ranks trades by profit, modeled probability, or balanced quality. Orders stay in Webull. No $1,000 trade cap.")
+    st.caption("One tap searches candidate stocks, checks puts and calls, and ranks trades by profit, modeled probability, or balanced quality. Orders stay in Webull. No fixed equity-input maximum or $1,000 trade cap.")
 
     sandbox_token = get_secret("TRADIER_SANDBOX_TOKEN")
     providers = ["Cboe delayed option chains (no account; best effort)", "Yahoo Finance (no account; less reliable)"]
@@ -678,7 +678,12 @@ def main():
     with st.expander("Account, risk, and scan settings", expanded=True):
         left, right = st.columns(2)
         with left:
-            account = st.number_input("Account equity ($)", 100, 500000, 4300, 100)
+            # No hard-coded maximum; enter the actual account equity at any scale.
+            account = st.number_input(
+                "Account equity ($)", min_value=1.0, value=4300.0,
+                step=100.0, format="%.2f", key="account_equity_input",
+                help="No fixed maximum. The amount entered is used to test affordability, not to limit the displayed stock universe arbitrarily.",
+            )
             # No arbitrary per-trade ceiling. A trade may use up to the entered account
             # equity, subject to its real cash collateral / 100-share requirement.
             budget = float(account)
@@ -705,6 +710,12 @@ def main():
         assumed_iv = st.slider("Assumed annual IV (%)", 15, 200, 65, 5) / 100 if assumption else .65
         extra_text = st.text_input("Optional extra tickers (not required)", "", placeholder="e.g. SOFI, BB")
         st.caption("Default scans a diversified subset of active stocks; it does NOT search every listed US option. For standard 100-share options, the eligibility check uses your entered account equity as the maximum required capital, not your actual Webull available cash. Earnings and other major events are not yet automatically checked.")
+
+    if "report" in st.session_state and st.session_state.get("report_equity") != float(account):
+        st.warning(
+            f"Account equity changed to ${account:,.2f}. Results below are from your previous scan "
+            "until you press **Discover stocks & generate ranked report** again."
+        )
 
     if st.button("🔍 Discover stocks & generate ranked report", type="primary", use_container_width=True):
         today = datetime.now(NY).date()
@@ -818,6 +829,7 @@ def main():
             diagnostics.append({"Ticker": ticker, "Result": note})
             progress.progress(idx / len(symbols), text=f"Checked {idx}/{len(symbols)} stocks: {ticker}")
         progress.empty()
+        st.session_state.report_equity = float(account)
         st.session_state.report = results
         st.session_state.stock_moves = stock_moves
         st.session_state.diagnostics = diagnostics
