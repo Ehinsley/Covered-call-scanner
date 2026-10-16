@@ -646,7 +646,7 @@ def selection_from_discovery(web_items, universe_limit):
 def main():
     st.set_page_config(page_title="Automatic Options Opportunity Report", page_icon="📈", layout="wide")
     st.title("📈 Automatic Options Opportunity Report")
-    st.caption("One tap searches candidate stocks, checks puts and calls, and ranks trade opportunities. Orders stay in Webull.")
+    st.caption("One tap searches candidate stocks, checks puts and calls, and ranks trades by profit, modeled probability, or balanced quality. Orders stay in Webull.")
 
     sandbox_token = get_secret("TRADIER_SANDBOX_TOKEN")
     providers = ["Cboe delayed option chains (no account; best effort)", "Yahoo Finance (no account; less reliable)"]
@@ -826,11 +826,42 @@ def main():
             if view != "All directions":
                 df = df[df["Day direction"] == view]
             df = match_trend_filter(df, trend_view)
-            top = df.drop_duplicates("Ticker").head(10)
+            # Three independent rankings; use one best contract per ticker for the shortlists.
+            best_balance = df.sort_values(["Score / 100", "Max return %", "Model POP %"],
+                                          ascending=[False, False, False], na_position="last")
+            most_profit = df.sort_values(["Max profit $", "Score / 100", "Model POP %"],
+                                         ascending=[False, False, False], na_position="last")
+            with_pop = df[df["Model POP %"].notna()]
+            most_probability = with_pop.sort_values(["Model POP %", "Max profit $", "Score / 100"],
+                                                    ascending=[False, False, False], na_position="last")
+            top = best_balance.drop_duplicates("Ticker").head(10)
+            top_profit = most_profit.drop_duplicates("Ticker").head(10)
+            top_probability = most_probability.drop_duplicates("Ticker").head(10)
             st.metric("Matching contracts (daily + multi-day filters)", len(df))
             st.metric("Matching tickers", int(df.Ticker.nunique()))
-            tabs = st.tabs(["🏆 Top ten", "📑 All qualifying", "📈 Stock movement", "🔎 Scan diagnostics"])
-            key_cols = ["Score / 100", "Ticker", "Strategy", "Stock $", "Day direction", "Day change %", "5d change %", "30d change %", "Trend pattern", "Expiration", "Strike $", "Bid $", "Ask $", "Premium $", "Cash needed $", "Break-even $", "Max return %", "Model POP %", "Model assign %", "Open interest", "Spread %", "Quote time ET"]
+            st.caption("Three different rankings of the same eligible trades. Maximum profit is capped dollar upside "
+                       "per contract, **not expected profit**. Model POP is an estimated likelihood of positive "
+                       "payoff at expiration, **not a guaranteed win rate**.")
+            if not df.empty:
+                summary_columns = st.columns(3)
+                if not top.empty:
+                    chosen = top.iloc[0]
+                    summary_columns[0].metric("🏆 Best overall score", f"{chosen['Score / 100']:.1f}/100")
+                    summary_columns[0].caption(f"{chosen['Ticker']} · {chosen['Strategy']} · ${chosen['Strike $']:g} strike")
+                if not top_profit.empty:
+                    chosen = top_profit.iloc[0]
+                    summary_columns[1].metric("💵 Highest max profit", f"${chosen['Max profit $']:,.0f}")
+                    summary_columns[1].caption(f"{chosen['Ticker']} · {chosen['Strategy']} · ${chosen['Strike $']:g} strike")
+                if not top_probability.empty:
+                    chosen = top_probability.iloc[0]
+                    summary_columns[2].metric("🎯 Highest modeled POP", f"{chosen['Model POP %']:.1f}%")
+                    summary_columns[2].caption(f"{chosen['Ticker']} · {chosen['Strategy']} · ${chosen['Strike $']:g} strike")
+                else:
+                    summary_columns[2].metric("🎯 Highest modeled POP", "Unavailable")
+                    summary_columns[2].caption("No usable option implied volatility in qualifying trades")
+            tabs = st.tabs(["🏆 Best overall", "💵 Highest profit", "🎯 Highest probability",
+                            "📑 All qualifying", "📈 Stock movement", "🔎 Scan diagnostics"])
+            key_cols = ["Score / 100", "Ticker", "Strategy", "Stock $", "Day direction", "Day change %", "5d change %", "30d change %", "Trend pattern", "Expiration", "Strike $", "Bid $", "Ask $", "Premium $", "Cash needed $", "Break-even $", "Max profit $", "Max return %", "Model POP %", "Model assign %", "Open interest", "Spread %", "Quote time ET"]
             with tabs[0]:
                 if top.empty:
                     st.info("No qualified trades match this Up/Down filter. Choose 'All directions' or run a wider scan.")
@@ -856,19 +887,61 @@ def main():
                         a, b = st.columns(2)
                         a.metric("Premium at bid", f"${candidate['Premium $']:,.0f}")
                         b.metric("Cash required", f"${candidate['Cash needed $']:,.0f}")
-                        a.metric("Max return if capped", f"{candidate['Max return %']:.1f}%")
-                        b.metric("Break-even", f"${candidate['Break-even $']:.2f}")
+                        a.metric("Max profit (capped)", f"${candidate['Max profit $']:,.0f}")
+                        b.metric("Max return if capped", f"{candidate['Max return %']:.1f}%")
+                        a.metric("Break-even", f"${candidate['Break-even $']:.2f}")
                         prob = candidate['Model POP %']
-                        st.caption(f"Model profit probability: {prob:.1f}%" if pd.notna(prob) else
-                                   "Model profit probability: unavailable (option IV missing)")
+                        b.metric("Modeled profit chance", f"{prob:.1f}%" if pd.notna(prob) else "N/A")
                         st.caption(f"Option bid/ask: ${candidate['Bid $']:.2f} / ${candidate['Ask $']:.2f} · "
                                    f"OI: {int(candidate['Open interest'])} · Quote: {candidate['Quote time ET']}")
                 st.caption("The 0–100 rating is a heuristic, **not** a probability that a stock will rise or a trade will succeed.")
             with tabs[1]:
-                st.dataframe(df, hide_index=True, use_container_width=True)
-                st.download_button("⬇️ Download ranked report (CSV / Excel)", df.to_csv(index=False).encode("utf-8-sig"),
-                                   file_name=f"ranked_options_report_{datetime.now(NY).date().isoformat()}.csv", mime="text/csv", use_container_width=True)
+                st.markdown("**Top 10 largest maximum dollar profits per 1 standard contract.** "
+                            "This is the best-case capped payoff if shares are assigned or the put expires worthless; "
+                            "it does not mean the trade is likely to make that amount.")
+                if top_profit.empty:
+                    st.info("No qualifying trades match the selected trend filters.")
+                else:
+                    for place, (_, candidate) in enumerate(top_profit.head(3).iterrows(), 1):
+                        st.markdown(f"**#{place} · {candidate['Ticker']} · {candidate['Strategy']}** "
+                                    f"· ${candidate['Strike $']:g} strike · {candidate['Expiration']}")
+                        first, second, third = st.columns(3)
+                        first.metric("Max profit", f"${candidate['Max profit $']:,.0f}")
+                        second.metric("Model POP", f"{candidate['Model POP %']:.1f}%" if pd.notna(candidate['Model POP %']) else "N/A")
+                        third.metric("Cash needed", f"${candidate['Cash needed $']:,.0f}")
+                    st.dataframe(top_profit[key_cols], hide_index=True, use_container_width=True)
+                    st.download_button("⬇️ Download highest-profit trades (CSV)",
+                                       top_profit[key_cols].to_csv(index=False).encode("utf-8-sig"),
+                                       file_name=f"highest_profit_{datetime.now(NY).date().isoformat()}.csv",
+                                       mime="text/csv", use_container_width=True)
+                st.caption("Highest max profit may also carry much greater downside risk. Check quote age, "
+                           "bid/ask spreads, IV and earnings before placing an order in Webull.")
             with tabs[2]:
+                st.markdown("**Top 10 highest modeled probability-of-profit trades.** "
+                            "Missing-IV trades are excluded from this ranking rather than assigned a made-up probability.")
+                if top_probability.empty:
+                    st.info("Probability ranking unavailable: no qualifying contracts have usable IV. "
+                            "Optionally turn on assumed IV in the scan settings, but such estimates are less reliable.")
+                else:
+                    for place, (_, candidate) in enumerate(top_probability.head(3).iterrows(), 1):
+                        st.markdown(f"**#{place} · {candidate['Ticker']} · {candidate['Strategy']}** "
+                                    f"· ${candidate['Strike $']:g} strike · {candidate['Expiration']}")
+                        first, second, third = st.columns(3)
+                        first.metric("Modeled POP", f"{candidate['Model POP %']:.1f}%")
+                        second.metric("Max profit", f"${candidate['Max profit $']:,.0f}")
+                        third.metric("Cash needed", f"${candidate['Cash needed $']:,.0f}")
+                    st.dataframe(top_probability[key_cols], hide_index=True, use_container_width=True)
+                    st.download_button("⬇️ Download highest-probability trades (CSV)",
+                                       top_probability[key_cols].to_csv(index=False).encode("utf-8-sig"),
+                                       file_name=f"highest_probability_{datetime.now(NY).date().isoformat()}.csv",
+                                       mime="text/csv", use_container_width=True)
+                st.caption("A modeled 90% POP does not imply a 90% chance of a good investment. "
+                           "Small premiums can carry large tail losses and the model is not calibrated or backtested.")
+            with tabs[3]:
+                st.dataframe(df[key_cols], hide_index=True, use_container_width=True)
+                st.download_button("⬇️ Download all qualifying trades (CSV / Excel)", df.to_csv(index=False).encode("utf-8-sig"),
+                                   file_name=f"ranked_options_report_{datetime.now(NY).date().isoformat()}.csv", mime="text/csv", use_container_width=True)
+            with tabs[4]:
                 movement_df = pd.DataFrame(all_moves)
                 if view != "All directions":
                     movement_df = movement_df[movement_df["Direction"] == view]
@@ -881,7 +954,7 @@ def main():
                 st.caption("Daily change is versus the prior session close. 5d/30d compare the selected source's "
                            "stock quote against Yahoo closes from 5 and 30 prior trading sessions. "
                            "Different data sources and stale stock quotes can distort the comparisons; check Webull.")
-            with tabs[3]:
+            with tabs[5]:
                 st.dataframe(pd.DataFrame(st.session_state.diagnostics), hide_index=True, use_container_width=True)
         else:
             st.warning("No qualifying quotes came back. Review the diagnostics below. If a free data feed reports missing dates, try another listed provider; do not assume the stock has no options.")
@@ -899,7 +972,9 @@ def main():
             st.dataframe(pd.DataFrame(st.session_state.diagnostics), hide_index=True, use_container_width=True)
 
     with st.expander("Important: how probabilities, scores, and risks work"):
-        st.markdown("""**Model POP** = probability the stock finishes above the trade's break-even at expiration under a zero-drift lognormal distribution using the option IV. It is *not backtested* and doesn't model earnings jumps, changing volatility or early assignment. If IV is missing, the probability stays blank unless you explicitly opt into a user-assumed IV. **Assignment** refers to ending ITM, not a guarantee of actual exercise behavior.\n\n**Ranking /100** combines modeled POP (33 points), capped return on required capital (25), option liquidity (20), break-even cushion (12), and an IV-risk term (10), with a low-share-price penalty. It is **not** a percentage chance of a good trade. Bids are used for premium and standard 100-share contracts only. Buying shares for a call requires 100 × stock price; cash-secured puts reserve 100 × strike even after premium. Stock losses can far exceed premium received.\n\n**Direction indicators:** green/up and red/down compare reported stock price against the previous trading close. They are **not predictions** and do not change trade-quality scores. For Cboe where previous-close data is missing, a Yahoo previous close may be used with a **cross-source** label. Timing differences can distort daily changes. If neither feed provides a usable prior close, the direction is Unknown rather than guessed.
+        st.markdown("""**Model POP** = probability the stock finishes above the trade's break-even at expiration under a zero-drift lognormal distribution using the option IV. It is *not backtested* and doesn't model earnings jumps, changing volatility or early assignment. If IV is missing, the probability stays blank unless you explicitly opt into a user-assumed IV. **Assignment** refers to ending ITM, not a guarantee of actual exercise behavior.\n\n**Three shortlists:** Best overall sorts by the 0–100 trade-quality score, highest profit sorts by the capped maximum dollar profit for one standard contract, and highest probability sorts by model POP at expiration. The shortlists show at most one option per ticker, but the All qualifying tab includes all qualifying contracts. Sorting by probability alone may favor tiny premiums, while sorting by potential profit may favor riskier underlying stocks.
+
+**Ranking /100** combines modeled POP (33 points), capped return on required capital (25), option liquidity (20), break-even cushion (12), and an IV-risk term (10), with a low-share-price penalty. It is **not** a percentage chance of a good trade. Bids are used for premium and standard 100-share contracts only. Buying shares for a call requires 100 × stock price; cash-secured puts reserve 100 × strike even after premium. Stock losses can far exceed premium received.\n\n**Direction indicators:** green/up and red/down compare reported stock price against the previous trading close. They are **not predictions** and do not change trade-quality scores. For Cboe where previous-close data is missing, a Yahoo previous close may be used with a **cross-source** label. Timing differences can distort daily changes. If neither feed provides a usable prior close, the direction is Unknown rather than guessed.
 
 **5-session / 30-session comparisons:** the app compares the selected provider's stock price with Yahoo Finance closing prices from 5 and 30 *prior trading sessions*, not 5 and 30 calendar days. They are observed price changes, not forecasts. They do not alter modeled profit probability or trade-quality ratings. If history is insufficient or unavailable the corresponding change displays N/A. When sources have different quote times, the percentages may be inaccurate. A five-session dip during a 30-session increase can be labeled a pullback, not automatically a buy signal.
 
