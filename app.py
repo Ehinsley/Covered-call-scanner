@@ -310,7 +310,7 @@ def safe_json_get(url, params=None, headers=None):
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def web_discover_symbols():
+def web_discover_symbols(max_stock_price):
     """Best-effort PUBLIC Nasdaq stock screen. Never described as exhaustive."""
     data = safe_json_get(NASDAQ_SCREEN, params={"tableonly": "true", "limit": "5000", "offset": "0", "download": "true"})
     body = data.get("data") or {}
@@ -325,7 +325,7 @@ def web_discover_symbols():
         market_cap = finite(r.get("marketCap"), 0)
         if not re.fullmatch(r"[A-Z]{1,5}", ticker):
             continue
-        if price is None or not 3 <= price <= 18 or volume < 500_000 or market_cap < 200_000_000:
+        if price is None or not 3 <= price <= max_stock_price or volume < 500_000 or market_cap < 200_000_000:
             continue
         if ticker in LEVERAGED_FUNDS:
             continue
@@ -572,7 +572,7 @@ def build_trade(ticker, spot, expiry, quote, budget, min_premium, min_oi, spread
     if side == "put":
         capital = strike * 100
         if capital > budget:
-            return None, "Put collateral exceeds per-trade limit"
+            return None, "Put collateral exceeds entered account equity"
         if not 0.65 <= strike / spot <= 1.03:
             return None, "Put strike too far ITM/OTM"
         breakeven = strike - bid
@@ -582,7 +582,7 @@ def build_trade(ticker, spot, expiry, quote, budget, min_premium, min_oi, spread
     else:
         capital = spot * 100
         if capital > budget:
-            return None, "Covered-call share cost exceeds limit"
+            return None, "Covered-call stock purchase exceeds entered account equity"
         if not 0.95 <= strike / spot <= 1.25:
             return None, "Call strike too far ITM/OTM"
         breakeven = spot - bid
@@ -600,12 +600,17 @@ def build_trade(ticker, spot, expiry, quote, budget, min_premium, min_oi, spread
     p_assign = None if p_above_strike is None else (1 - p_above_strike if side == "put" else p_above_strike)
     buffer = max(0, spot - breakeven) / spot
     score = score_trade(pop, roi, oi, volume, spread, buffer, volatility, spot)
+    account_use = 100 * capital / budget
+    concentration_flag = ("⚠️ 75%+ of account" if account_use >= 75
+                          else "50–75% of account" if account_use >= 50
+                          else "Under 50% of account")
     return {
         "Score / 100": score, "Ticker": ticker,
         "Strategy": "Cash-secured put" if side == "put" else "Covered call",
         "Stock $": round(spot, 2), "Expiration": expiry, "DTE": dte,
         "Strike $": round(strike, 2), "Bid $": round(bid, 2), "Ask $": round(ask, 2),
         "Premium $": round(premium, 2), "Cash needed $": round(capital, 2),
+        "Account use %": round(account_use, 1), "Concentration": concentration_flag,
         "Break-even $": round(breakeven, 2), "Max profit $": round(cap_profit, 2),
         "Max loss $": round(max_loss, 2), "Max return %": round(100 * roi, 2),
         "Model POP %": None if pop is None else round(100 * pop, 1),
@@ -620,7 +625,7 @@ def build_trade(ticker, spot, expiry, quote, budget, min_premium, min_oi, spread
     }, "OK"
 
 
-def selection_from_discovery(web_items, universe_limit):
+def selection_from_discovery(web_items, universe_limit, max_stock_price):
     """Combine curated liquid watchlist + diversified public screen, not whole market."""
     ticker_list = []
     for sym in STARTER_UNIVERSE:
@@ -628,17 +633,29 @@ def selection_from_discovery(web_items, universe_limit):
             ticker_list.append(sym)
     # Blend in online screener results so report scans stocks not known ahead of time.
     if web_items:
+        # Interleave price bands so 20–$60 underlyings are included in
+        # small scan batches, not crowded out by the old low-priced watchlist.
+        cutoff = max(12, max_stock_price)
+        bands = [(3, 10), (10, min(25, cutoff)), (min(25, cutoff), cutoff + .01)]
+        buckets = [[sym for sym, _, px in web_items if low <= px < high]
+                   for low, high in bands if high > low]
         diversified = []
-        for low, high in [(3, 6), (6, 10), (10, 18)]:
-            diversified += [sym for sym, _, px in web_items if low <= px < high][:max(3, universe_limit // 3)]
+        for index in range(universe_limit):
+            found_any = False
+            for bucket in buckets:
+                if index < len(bucket):
+                    diversified.append(bucket[index])
+                    found_any = True
+            if not found_any:
+                break
         result = []
-        for pair in zip(ticker_list, diversified + ticker_list):
-            for sym in pair:
-                if sym not in result:
-                    result.append(sym)
-        for sym in diversified:
-            if sym not in result:
-                result.append(sym)
+        # Alternate public-discovery picks with the established watchlist.
+        for index in range(max(len(diversified), len(ticker_list))):
+            for group in (diversified, ticker_list):
+                if index < len(group) and group[index] not in result:
+                    result.append(group[index])
+            if len(result) >= universe_limit:
+                break
         return result[:universe_limit]
     return ticker_list[:universe_limit]
 
@@ -646,7 +663,7 @@ def selection_from_discovery(web_items, universe_limit):
 def main():
     st.set_page_config(page_title="Automatic Options Opportunity Report", page_icon="📈", layout="wide")
     st.title("📈 Automatic Options Opportunity Report")
-    st.caption("One tap searches candidate stocks, checks puts and calls, and ranks trades by profit, modeled probability, or balanced quality. Orders stay in Webull.")
+    st.caption("One tap searches candidate stocks, checks puts and calls, and ranks trades by profit, modeled probability, or balanced quality. Orders stay in Webull. No $1,000 trade cap.")
 
     sandbox_token = get_secret("TRADIER_SANDBOX_TOKEN")
     providers = ["Cboe delayed option chains (no account; best effort)", "Yahoo Finance (no account; less reliable)"]
@@ -662,7 +679,10 @@ def main():
         left, right = st.columns(2)
         with left:
             account = st.number_input("Account equity ($)", 100, 500000, 4300, 100)
-            budget = st.number_input("Max per trade ($)", 100, int(account), min(1000, int(account)), 100)
+            # No arbitrary per-trade ceiling. A trade may use up to the entered account
+            # equity, subject to its real cash collateral / 100-share requirement.
+            budget = float(account)
+            st.caption(f"No separate per-trade cap · considering trades up to ${budget:,.0f} required capital.")
             strategy = st.selectbox("Trades to rank", ["Both", "Cash-secured puts", "Covered calls"])
             max_stocks = st.slider("Number of stocks to investigate", 6, 40, 16, 2,
                                    help="More tickers use more provider API calls and take longer. This is not a whole-market scan.")
@@ -672,7 +692,8 @@ def main():
             min_premium = st.number_input("Minimum premium per contract ($)", 0, 500, 30, 5)
             min_oi = st.number_input("Minimum open interest", 0, 10000, 100, 50)
             max_spread = st.slider("Maximum bid/ask spread (%)", 5, 100, 35, 5) / 100
-        use_web = st.checkbox("Automatically discover additional low-priced stocks from Nasdaq's public screener", True)
+        st.info("**Concentration warning:** Trades using 50%+ of the account are flagged, and those using 75%+ are highlighted. Account equity is NOT necessarily cash available to trade. Confirm buying power and collateral in Webull before any order.")
+        use_web = st.checkbox("Automatically discover additional stocks from Nasdaq's public screener", True)
         yahoo_move_fallback = st.checkbox(
             "Try Yahoo previous-close data when Cboe does not provide it", True,
             help="May add time to scans. When stock price and previous close are from different sources, the report labels the estimate and may be out of sync.")
@@ -683,7 +704,7 @@ def main():
         assumption = st.checkbox("Show probability estimates if option IV is missing (uses assumed IV)", False)
         assumed_iv = st.slider("Assumed annual IV (%)", 15, 200, 65, 5) / 100 if assumption else .65
         extra_text = st.text_input("Optional extra tickers (not required)", "", placeholder="e.g. SOFI, BB")
-        st.caption("Default scans a diversified subset of active stocks; it does NOT search every listed US option. Earnings and other major events are not yet automatically checked.")
+        st.caption("Default scans a diversified subset of active stocks; it does NOT search every listed US option. For standard 100-share options, the eligibility check uses your entered account equity as the maximum required capital, not your actual Webull available cash. Earnings and other major events are not yet automatically checked.")
 
     if st.button("🔍 Discover stocks & generate ranked report", type="primary", use_container_width=True):
         today = datetime.now(NY).date()
@@ -691,13 +712,17 @@ def main():
                   else CboeDelayed() if provider_choice.startswith("Cboe") else YahooBestEffort())
         diagnostics = []
         online_symbols = []
+        # Standard covered call needs 100 shares; a put can be secured below
+        # the spot price (down to the 0.65 strike/spot screening threshold).
+        # No historical $18 price ceiling remains.
+        max_discovery_price = budget / (100 * .65)
         if use_web:
             try:
-                online_symbols = web_discover_symbols()
+                online_symbols = web_discover_symbols(max_discovery_price)
                 st.info(f"Nasdaq web discovery returned {len(online_symbols)} eligible symbols before batching.")
             except Exception as exc:
                 st.warning(f"Nasdaq stock discovery unavailable ({type(exc).__name__}). Scanning the built-in liquid-stock universe instead.")
-        symbols = selection_from_discovery(online_symbols, max_stocks)
+        symbols = selection_from_discovery(online_symbols, max_stocks, max_discovery_price)
         extras = [s for s in re.split(r"[\s,;]+", extra_text.upper()) if re.fullmatch(r"[A-Z]{1,5}", s)]
         for extra in reversed(extras):
             if extra not in LEVERAGED_FUNDS:
@@ -713,8 +738,8 @@ def main():
             note = ""
             try:
                 spot, underlying_ts = source.spot(ticker)
-                if spot < 2 or spot > 18:
-                    raise ValueError("Stock outside $2–$18 discovery range")
+                if spot < 2 or spot > max_discovery_price:
+                    raise ValueError(f"Stock outside eligible screening range ($2–${max_discovery_price:,.2f} based on account equity)")
                 try:
                     movement = source.daily_move(ticker, spot)
                 except Exception:
@@ -840,8 +865,9 @@ def main():
             st.metric("Matching contracts (daily + multi-day filters)", len(df))
             st.metric("Matching tickers", int(df.Ticker.nunique()))
             st.caption("Three different rankings of the same eligible trades. Maximum profit is capped dollar upside "
-                       "per contract, **not expected profit**. Model POP is an estimated likelihood of positive "
-                       "payoff at expiration, **not a guaranteed win rate**.")
+                       "per contract, **not expected profit**. A large-dollar trade can rank higher simply because "
+                       "it ties up more of your account; compare Max return % and Account use %. "
+                       "Model POP is an estimated likelihood of positive payoff at expiration, **not a guaranteed win rate**.")
             if not df.empty:
                 summary_columns = st.columns(3)
                 if not top.empty:
@@ -861,7 +887,7 @@ def main():
                     summary_columns[2].caption("No usable option implied volatility in qualifying trades")
             tabs = st.tabs(["🏆 Best overall", "💵 Highest profit", "🎯 Highest probability",
                             "📑 All qualifying", "📈 Stock movement", "🔎 Scan diagnostics"])
-            key_cols = ["Score / 100", "Ticker", "Strategy", "Stock $", "Day direction", "Day change %", "5d change %", "30d change %", "Trend pattern", "Expiration", "Strike $", "Bid $", "Ask $", "Premium $", "Cash needed $", "Break-even $", "Max profit $", "Max return %", "Model POP %", "Model assign %", "Open interest", "Spread %", "Quote time ET"]
+            key_cols = ["Score / 100", "Ticker", "Strategy", "Stock $", "Day direction", "Day change %", "5d change %", "30d change %", "Trend pattern", "Expiration", "Strike $", "Bid $", "Ask $", "Premium $", "Cash needed $", "Account use %", "Concentration", "Break-even $", "Max profit $", "Max return %", "Model POP %", "Model assign %", "Open interest", "Spread %", "Quote time ET"]
             with tabs[0]:
                 if top.empty:
                     st.info("No qualified trades match this Up/Down filter. Choose 'All directions' or run a wider scan.")
@@ -887,6 +913,7 @@ def main():
                         a, b = st.columns(2)
                         a.metric("Premium at bid", f"${candidate['Premium $']:,.0f}")
                         b.metric("Cash required", f"${candidate['Cash needed $']:,.0f}")
+                        st.caption(f"Account capital used: {candidate['Account use %']:.1f}% · {candidate['Concentration']}")
                         a.metric("Max profit (capped)", f"${candidate['Max profit $']:,.0f}")
                         b.metric("Max return if capped", f"{candidate['Max return %']:.1f}%")
                         a.metric("Break-even", f"${candidate['Break-even $']:.2f}")
@@ -909,6 +936,7 @@ def main():
                         first.metric("Max profit", f"${candidate['Max profit $']:,.0f}")
                         second.metric("Model POP", f"{candidate['Model POP %']:.1f}%" if pd.notna(candidate['Model POP %']) else "N/A")
                         third.metric("Cash needed", f"${candidate['Cash needed $']:,.0f}")
+                        st.caption(f"Capital concentration: {candidate['Account use %']:.1f}% of account · {candidate['Concentration']}")
                     st.dataframe(top_profit[key_cols], hide_index=True, use_container_width=True)
                     st.download_button("⬇️ Download highest-profit trades (CSV)",
                                        top_profit[key_cols].to_csv(index=False).encode("utf-8-sig"),
@@ -930,6 +958,7 @@ def main():
                         first.metric("Modeled POP", f"{candidate['Model POP %']:.1f}%")
                         second.metric("Max profit", f"${candidate['Max profit $']:,.0f}")
                         third.metric("Cash needed", f"${candidate['Cash needed $']:,.0f}")
+                        st.caption(f"Capital concentration: {candidate['Account use %']:.1f}% of account · {candidate['Concentration']}")
                     st.dataframe(top_probability[key_cols], hide_index=True, use_container_width=True)
                     st.download_button("⬇️ Download highest-probability trades (CSV)",
                                        top_probability[key_cols].to_csv(index=False).encode("utf-8-sig"),
@@ -973,6 +1002,8 @@ def main():
 
     with st.expander("Important: how probabilities, scores, and risks work"):
         st.markdown("""**Model POP** = probability the stock finishes above the trade's break-even at expiration under a zero-drift lognormal distribution using the option IV. It is *not backtested* and doesn't model earnings jumps, changing volatility or early assignment. If IV is missing, the probability stays blank unless you explicitly opt into a user-assumed IV. **Assignment** refers to ending ITM, not a guarantee of actual exercise behavior.\n\n**Three shortlists:** Best overall sorts by the 0–100 trade-quality score, highest profit sorts by the capped maximum dollar profit for one standard contract, and highest probability sorts by model POP at expiration. The shortlists show at most one option per ticker, but the All qualifying tab includes all qualifying contracts. Sorting by probability alone may favor tiny premiums, while sorting by potential profit may favor riskier underlying stocks.
+
+**Capital filter:** there is no separate $1,000 per-trade cap. Each standard 100-share covered call or cash-secured put must require no more than the **entered account equity** (default $4,300). Cash-secured puts require 100 × strike, covered calls need 100 × share price. This does not know your true available buying power or account funds already committed elsewhere. Trades using 50% or more of equity are labeled as concentrated; 75% or more are flagged prominently. This is a warning, not a rejection.
 
 **Ranking /100** combines modeled POP (33 points), capped return on required capital (25), option liquidity (20), break-even cushion (12), and an IV-risk term (10), with a low-share-price penalty. It is **not** a percentage chance of a good trade. Bids are used for premium and standard 100-share contracts only. Buying shares for a call requires 100 × stock price; cash-secured puts reserve 100 × strike even after premium. Stock losses can far exceed premium received.\n\n**Direction indicators:** green/up and red/down compare reported stock price against the previous trading close. They are **not predictions** and do not change trade-quality scores. For Cboe where previous-close data is missing, a Yahoo previous close may be used with a **cross-source** label. Timing differences can distort daily changes. If neither feed provides a usable prior close, the direction is Unknown rather than guessed.
 
